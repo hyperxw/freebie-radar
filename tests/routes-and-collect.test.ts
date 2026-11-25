@@ -1154,9 +1154,11 @@ test("VPS Cookie 托管：支持 Header/JSON 解析、脱敏查询及触发 xhs-
     assert.equal(colJson.summary.inserted, 1);
     const savedItem = get<{ content: string | null }>("SELECT content FROM items WHERE source_id = 'xhs-search' LIMIT 1");
     assert.match(savedItem?.content ?? "", /详细正文内容/);
-    const got = receivedPayload as { site?: string; proxy?: string } | null;
+    const got = receivedPayload as { site?: string; proxy?: string; maxAgeDays?: number; knownUrls?: string[] } | null;
     assert.equal(got?.site, "xhs");
     assert.equal(got?.proxy, "http://47.110.65.20:8888");
+    assert.equal(got?.maxAgeDays, 7);
+    assert.ok(Array.isArray(got?.knownUrls));
 
     // Cookie 过期时应明确报失败并提示更新 Cookie
     expireMode = true;
@@ -1167,4 +1169,118 @@ test("VPS Cookie 托管：支持 Header/JSON 解析、脱敏查询及触发 xhs-
   } finally {
     mockSrv.close();
   }
+});
+
+test("入库拦截 7 天外小红书旧帖与已过期活动，重采不覆盖已有时间且支持历史回填", async () => {
+  const { ingestItems, backfillXhsAndExpiry } = await import("../src/server/collectors/index.ts");
+  run("DELETE FROM items");
+  run("DELETE FROM settings WHERE key = 'backfill_xhs_expiry_v1'");
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const oldHex = Math.floor(nowSec - 10 * 86_400).toString(16).padStart(8, "0") + "000000002a00d0d4";
+  const freshHex = Math.floor(nowSec - 2 * 3600).toString(16).padStart(8, "0") + "000000002a00d0d5";
+
+  // 1) 未显式传 publishedAt 的 10 天前小红书帖子，入库兜底解码 ID 时间后直接拦截
+  const staleXhs = ingestItems("xhs-search", [
+    {
+      externalId: `https://www.xiaohongshu.com/explore/${oldHex}`,
+      url: `https://www.xiaohongshu.com/explore/${oldHex}`,
+      title: "智谱再送1.5亿Token",
+      publishedAt: null,
+    },
+  ]);
+  assert.equal(staleXhs.inserted, 0);
+  assert.equal(staleXhs.skipped, 1);
+
+  // 2) 新帖若标题/正文已明确过期，首次入库直接跳过，不入库也不触发推送
+  const pastDay = new Date(Date.now() - 3 * 86_400_000);
+  const pastYmd = `${pastDay.getFullYear()}-${String(pastDay.getMonth() + 1).padStart(2, "0")}-${String(pastDay.getDate()).padStart(2, "0")}`;
+  const alreadyExpired = ingestItems("xhs-search", [
+    {
+      externalId: `https://www.xiaohongshu.com/explore/${freshHex}`,
+      url: `https://www.xiaohongshu.com/explore/${freshHex}`,
+      title: "限时送额度福利",
+      content: `活动截止 ${pastYmd} 过期`,
+    },
+  ]);
+  assert.equal(alreadyExpired.inserted, 0);
+  assert.equal(alreadyExpired.skipped, 1);
+
+  // 3) 重复采集缺失字段时不得清空已有的 published_at / expires_at / summary
+  const futureExp = new Date(Date.now() + 5 * 86_400_000).toISOString();
+  const validUrl = `https://www.xiaohongshu.com/explore/${freshHex}`;
+  const pubIso = new Date((nowSec - 3600) * 1000).toISOString();
+  assert.equal(
+    ingestItems("xhs-search", [
+      {
+        externalId: validUrl,
+        url: validUrl,
+        title: "免费送 AI Token 福利",
+        summary: "详情说明：注册即可领",
+        publishedAt: pubIso,
+        expiresAt: futureExp,
+      },
+    ]).inserted,
+    1,
+  );
+  // 再次采集时只给了标题和空摘要
+  assert.equal(
+    ingestItems("xhs-search", [
+      {
+        externalId: validUrl,
+        url: validUrl,
+        title: "免费送 AI Token 福利",
+        summary: "",
+        publishedAt: null,
+        expiresAt: null,
+      },
+    ]).inserted,
+    0,
+  );
+  const keptRow = get<{ summary: string; published_at: string | null; expires_at: string | null }>(
+    "SELECT summary, published_at, expires_at FROM items WHERE external_id = ?",
+    validUrl,
+  );
+  assert.equal(keptRow?.summary, "详情说明：注册即可领");
+  assert.equal(keptRow?.published_at, pubIso);
+  assert.equal(keptRow?.expires_at, futureExp);
+
+  // 4) 历史回填：清理占位符、补齐小红书发布时间、标记已过期活动
+  const nowIso = new Date().toISOString();
+  run(
+    `INSERT INTO items (source_id, external_id, url, url_key, title, summary, content, category, score, published_at, expires_at, status, first_seen_at, last_seen_at)
+     VALUES ('xhs-search', ?, ?, ?, '旧小红书无时间', '还没有简介', '还没有简介', 'ai', 65, NULL, NULL, 'active', ?, ?)`,
+    `https://www.xiaohongshu.com/explore/${oldHex}`,
+    `https://www.xiaohongshu.com/explore/${oldHex}`,
+    `www.xiaohongshu.com/explore/${oldHex}`,
+    nowIso,
+    nowIso,
+  );
+  run(
+    `INSERT INTO items (source_id, external_id, url, url_key, title, summary, category, score, published_at, expires_at, status, first_seen_at, last_seen_at)
+     VALUES ('v2ex-free', 'old-exp-1', 'https://v2ex.com/t/oldexp1', 'v2ex.com/t/oldexp1', '免费领会员', ?, 'media', 70, ?, NULL, 'active', ?, ?)`,
+    `活动 ${pastYmd} 截止`,
+    new Date(Date.now() - 5 * 86_400_000).toISOString(),
+    nowIso,
+    nowIso,
+  );
+
+  const bf = backfillXhsAndExpiry();
+  assert.equal(bf.cleanedPlaceholder, 2);
+  assert.equal(bf.xhsBackfilled, 1);
+  assert.equal(bf.expiredMarked, 1);
+
+  const backfilledXhs = get<{ published_at: string | null; content: string | null; summary: string }>(
+    "SELECT published_at, content, summary FROM items WHERE url = ?",
+    `https://www.xiaohongshu.com/explore/${oldHex}`,
+  );
+  assert.ok(backfilledXhs?.published_at);
+  assert.equal(backfilledXhs?.content, null);
+  assert.equal(backfilledXhs?.summary, "");
+
+  const expiredRow = get<{ status: string; score: number }>(
+    "SELECT status, score FROM items WHERE external_id = 'old-exp-1'",
+  );
+  assert.equal(expiredRow?.status, "expired");
+  assert.equal(expiredRow?.score, 0);
 });

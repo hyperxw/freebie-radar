@@ -1,4 +1,4 @@
-import { cleanText, guessExpiry, normalizeUrl, sanitizeImageUrl, urlKey } from "./normalize.ts";
+import { cleanText, guessExpiry, normalizeUrl, sanitizeImageUrl, urlKey, xhsPublishedAtFromUrl } from "./normalize.ts";
 import type { RawItem } from "../collectors/types.ts";
 import { extractCodes } from "./codes.ts";
 import { extractPrice } from "./pricing.ts";
@@ -571,19 +571,28 @@ export function enrichItem(
 ): EnrichedItem | null {
   const title = cleanText(raw.title, 200);
   if (!title) return null;
-  const summary = cleanText(raw.summary ?? "", 400);
+  const rawSummary = (raw.summary ?? "").trim() === "还没有简介" ? "" : raw.summary;
+  const rawContent = raw.content && raw.content.trim() === "还没有简介" ? null : (raw.content ?? null);
+  const summary = cleanText(rawSummary ?? "", 400);
   const url = normalizeUrl(raw.url);
   if (!url) return null;
+  const publishedAt =
+    raw.publishedAt ??
+    (sourceId === "xhs-search" || /xiaohongshu\.com\/(?:explore|search_result|discovery\/item)\/[0-9a-f]{24}/i.test(url)
+      ? xhsPublishedAtFromUrl(url)
+      : null);
 
   const guessed = classify(title, summary);
   const hintCat = raw.categoryHint ?? hints?.categoryHint ?? null;
   let category: Category = guessed.category === "other" && isCategory(hintCat) ? hintCat : guessed.category;
-  if (isSharedResource(title, raw.summary ?? "", raw.content ?? "", raw.url)) category = "pan";
+  if (isSharedResource(title, rawSummary ?? "", rawContent ?? "", raw.url)) category = "pan";
   category = categoryForSource(sourceId, category, hints);
   let tags = guessed.tags;
-  const codes = extractCodes(title, raw.content ?? raw.summary ?? "");
+  const codes = extractCodes(title, rawContent ?? rawSummary ?? "");
   const priceInfo = extractPrice(title, summary);
-  const expiresAt = raw.expiresAt ?? guessExpiry(`${title} ${summary}`);
+  const expiresAt =
+    raw.expiresAt ??
+    (guessExpiry(`${title} ${summary}`, publishedAt) || (rawContent ? guessExpiry(rawContent, publishedAt) : null));
   let obtain = guessObtain(title, summary, priceInfo);
   const kindInput = {
     title,
@@ -618,7 +627,7 @@ export function enrichItem(
   const { score, reason } = scoreItem({
     title,
     summary,
-    publishedAt: raw.publishedAt ?? null,
+    publishedAt,
     sourceId,
     category,
     tags,
@@ -633,6 +642,8 @@ export function enrichItem(
 
   return {
     ...raw,
+    content: rawContent,
+    publishedAt,
     codes,
     price: priceInfo.price,
     isFree: priceInfo.isFree,

@@ -67,7 +67,39 @@ CHATTER_RE = re.compile(
 
 
 def _clean_text(text: str, limit: int = 3500) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()[:limit]
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if not cleaned or cleaned == "还没有简介":
+        return ""
+    return cleaned[:limit]
+
+
+_XHS_ID_RE = re.compile(r"(?:explore|search_result|discovery/item)/([0-9a-f]{24})(?:$|[/?#])", re.I)
+_MIN_XHS_TS = 1_420_070_400
+
+
+def _xhs_published_at_from_url(url: str, now_ts: float | None = None) -> str | None:
+    m = _XHS_ID_RE.search(url or "")
+    if not m:
+        return None
+    try:
+        sec = int(m.group(1)[:8], 16)
+    except ValueError:
+        return None
+    now = now_ts if now_ts is not None else time.time()
+    if sec < _MIN_XHS_TS or sec > now + 86400:
+        return None
+    return datetime.fromtimestamp(sec, tz=timezone.utc).isoformat()
+
+
+def _is_older_than_days(iso: str | None, max_days: int, now_ts: float | None = None) -> bool:
+    if not iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        now = now_ts if now_ts is not None else time.time()
+        return (now - dt.timestamp()) > max_days * 86400
+    except Exception:
+        return False
 
 
 def collect_zhihu(page, keywords):
@@ -154,13 +186,15 @@ def collect_zhihu(page, keywords):
     ]
 
 
-def collect_xhs(page, keywords):
+def collect_xhs(page, keywords, max_age_days: int = 7, known_urls=None):
     seen = {}
-    detail_budget = 6
+    detail_budget = 24
     last_err = None
+    known_set = set(known_urls or [])
+    max_age_days = max(int(max_age_days or 7), 1)
 
     for kw in keywords:
-        if len(seen) >= 45:
+        if len(seen) >= 60:
             break
         url = (
             "https://www.xiaohongshu.com/search_result?keyword="
@@ -178,8 +212,19 @@ def collect_xhs(page, keywords):
             last_err = err
             continue
         try:
-            page.locator("text=最新").first.click(timeout=1500)
-            page.wait_for_timeout(800)
+            newest = page.get_by_text("最新", exact=True).first
+            if newest.is_visible(timeout=1000):
+                newest.click(timeout=1500)
+                page.wait_for_timeout(900)
+            else:
+                flt = page.get_by_text("筛选", exact=True).first
+                if flt.is_visible(timeout=800):
+                    flt.click(timeout=1000)
+                    page.wait_for_timeout(400)
+                    newest = page.get_by_text("最新", exact=True).first
+                    if newest.is_visible(timeout=1200):
+                        newest.click(timeout=1500)
+                        page.wait_for_timeout(900)
         except Exception:
             pass
         page.mouse.wheel(0, 1600)
@@ -210,21 +255,30 @@ def collect_xhs(page, keywords):
         if state.get("needLogin") and not state.get("items"):
             raise PermissionError("小红书 Cookie 已失效或被跳转国际版/验证")
 
+        now_ts = time.time()
         batch_targets = []
         for it in state.get("items", []):
-            seen.setdefault(it["url"], it)
+            id_pub = _xhs_published_at_from_url(it["url"], now_ts)
+            if id_pub:
+                it["publishedAt"] = id_pub
+            if _is_older_than_days(id_pub, max_age_days + 3, now_ts):
+                seen.setdefault(it["url"], {**it, "stalePreFiltered": True})
+                continue
+            cur = seen.setdefault(it["url"], it)
             if (
                 detail_budget > 0
-                and len(batch_targets) < 3
-                and not seen[it["url"]].get("content")
+                and not cur.get("detailChecked")
+                and it["url"] not in known_set
                 and not CHATTER_RE.search(it["title"])
                 and it.get("fetchUrl")
             ):
+                cur["detailChecked"] = True
                 batch_targets.append({"url": it["url"], "fetchUrl": it["fetchUrl"]})
                 detail_budget -= 1
 
-        # 并发 fetch 笔记 SSR HTML（精确按 URL 一一对应，彻底无弹窗错位）
-        if batch_targets:
+        # 并发 fetch 笔记 SSR HTML（正文与发布时间解耦，纯图帖也不丢时间）
+        for i in range(0, len(batch_targets), 4):
+            chunk = batch_targets[i : i + 4]
             try:
                 details = page.evaluate(
                     """async (targets) => {
@@ -234,7 +288,9 @@ def collect_xhs(page, keywords):
                           const r = await fetch(fetchUrl, { credentials: 'include', signal: AbortSignal.timeout(8000) });
                           if (!r.ok) return;
                           const html = await r.text();
-                          const dMatch = html.match(/"desc":"((?:\\\\.|[^"])*)"/);
+                          const idx = html.indexOf('"noteDetailMap"');
+                          const scope = idx >= 0 ? html.slice(idx) : html;
+                          const dMatch = scope.match(/"desc":"((?:\\\\.|[^"])*)"/) || html.match(/"desc":"((?:\\\\.|[^"])*)"/);
                           let desc = '';
                           if (dMatch) {
                             try { desc = JSON.parse('"' + dMatch[1] + '"'); } catch { desc = dMatch[1]; }
@@ -244,31 +300,36 @@ def collect_xhs(page, keywords):
                               || html.match(/<meta\\s+content="([^"]*)"\\s+name="description"/i);
                             if (m) desc = m[1];
                           }
-                          const tMatch = html.match(/"time":(\\d{10,13})/);
+                          const tMatch = scope.match(/"time":(\\d{10,13})/);
                           const ts = tMatch ? Number(tMatch[1]) : 0;
-                          if (desc && desc.trim()) {
-                            out[url] = { desc: desc.trim().slice(0, 3500), ts: Number.isFinite(ts) ? ts : 0 };
-                          }
+                          out[url] = { desc: (desc || '').trim().slice(0, 3500), ts: Number.isFinite(ts) ? ts : 0 };
                         } catch {}
                       }));
                       return out;
                     }""",
-                    batch_targets,
+                    chunk,
                 )
                 for u, d in (details or {}).items():
-                    if u in seen and d.get("desc"):
-                        seen[u]["content"] = d["desc"]
-                        seen[u]["summary"] = _clean_text(d["desc"], 380)
-                        ts = d.get("ts") or 0
-                        if ts > 0:
-                            sec = ts / 1000.0 if ts > 1e12 else float(ts)
+                    if u not in seen:
+                        continue
+                    cleaned = _clean_text(d.get("desc") or "", 3500)
+                    if cleaned:
+                        seen[u]["content"] = cleaned
+                        seen[u]["summary"] = cleaned[:380]
+                    ts = d.get("ts") or 0
+                    if ts > 0:
+                        sec = ts / 1000.0 if ts > 1e12 else float(ts)
+                        if sec >= _MIN_XHS_TS and sec <= time.time() + 86400:
                             seen[u]["publishedAt"] = datetime.fromtimestamp(sec, tz=timezone.utc).isoformat()
             except Exception:
                 pass
+            if i + 4 < len(batch_targets):
+                page.wait_for_timeout(250)
 
     if not seen and last_err is not None:
         raise last_err
 
+    now_ts = time.time()
     return [
         {
             "externalId": it["url"],
@@ -282,6 +343,7 @@ def collect_xhs(page, keywords):
             "tags": ["xiaohongshu", "cookie-vps"],
         }
         for it in seen.values()
+        if not it.get("stalePreFiltered") and not _is_older_than_days(it.get("publishedAt"), max_age_days, now_ts)
     ]
 
 
@@ -419,7 +481,7 @@ def collect_xiaoheihe(page, keywords):
     return items
 
 
-def run_collect(site: str, raw_cookies, keywords, proxy_url: str):
+def run_collect(site: str, raw_cookies, keywords, proxy_url: str, max_age_days: int = 7, known_urls=None):
     domain_map = {"zhihu": ".zhihu.com", "xhs": ".xiaohongshu.com", "xiaoheihe": ".xiaoheihe.cn"}
     cookies = normalize_cookies(raw_cookies, domain_map[site])
     if not cookies:
@@ -439,7 +501,7 @@ def run_collect(site: str, raw_cookies, keywords, proxy_url: str):
                 if site == "zhihu":
                     return collect_zhihu(page, keywords)
                 if site == "xhs":
-                    return collect_xhs(page, keywords)
+                    return collect_xhs(page, keywords, max_age_days=max_age_days, known_urls=known_urls)
                 if site == "xiaoheihe":
                     return collect_xiaoheihe(page, keywords)
                 raise ValueError(f"Unsupported site: {site}")
@@ -495,8 +557,10 @@ class Handler(BaseHTTPRequestHandler):
         keywords = body.get("keywords") or ["免费领取"]
         cookies = body.get("cookies") or []
         proxy = str(body.get("proxy", "") or "").strip()
+        max_age_days = int(body.get("maxAgeDays") or 7)
+        known_urls = body.get("knownUrls") or []
         try:
-            items = run_collect(site, cookies, keywords, proxy)
+            items = run_collect(site, cookies, keywords, proxy, max_age_days=max_age_days, known_urls=known_urls)
             self._send_json(200, {"ok": True, "items": items})
         except PermissionError as err:
             self._send_json(200, {"ok": False, "needLogin": True, "error": str(err)})

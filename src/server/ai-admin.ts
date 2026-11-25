@@ -8,6 +8,7 @@ import { aiQueueStats } from "./enrich/ai-queue.ts";
 import { getSourceHints, applyManualClassification, getManualClassification } from "./source-settings.ts";
 import { categoryForSource } from "../shared/source-classification.ts";
 import { isSharedResource } from "./enrich/evidence.ts";
+import { parseAiExpiry } from "./enrich/normalize.ts";
 import { finishAiJob, getAiTelemetry, recordAiBatch, startAiJob } from "./enrich/ai-telemetry.ts";
 import { aiDedupDegradation, aiDedupStats, dedupeKeptItemsWithAi } from "./enrich/ai-dedup.ts";
 import {
@@ -33,9 +34,24 @@ function updateAi(
   quality: number | null,
   price: number | null,
   isFree: boolean,
+  expiresAt: string | null = null,
+  expired = false,
 ): void {
   run(
-    "UPDATE items SET ai = ?, ai_keep = ?, score = ?, category = ?, obtain = ?, kind = ?, ai_quality = COALESCE(?, ai_quality), ai_reviewed_at = ?, price = ?, is_free = ? WHERE id = ?",
+    `UPDATE items
+        SET ai = ?,
+            ai_keep = ?,
+            score = ?,
+            category = ?,
+            obtain = ?,
+            kind = ?,
+            ai_quality = COALESCE(?, ai_quality),
+            expires_at = COALESCE(expires_at, ?),
+            status = CASE WHEN ? = 1 AND status != 'ignored' THEN 'expired' ELSE status END,
+            ai_reviewed_at = ?,
+            price = ?,
+            is_free = ?
+      WHERE id = ?`,
     ai,
     keep,
     score,
@@ -43,6 +59,8 @@ function updateAi(
     obtain,
     kind,
     quality,
+    expiresAt,
+    expired ? 1 : 0,
     new Date().toISOString(),
     price,
     isFree ? 1 : 0,
@@ -204,6 +222,7 @@ let rejected = 0;
         title: r.title,
         summary: r.summary ?? "",
         content: r.content ?? null,
+        publishedAt: r.published_at ?? null,
       }));
       let map;
       try {
@@ -308,19 +327,24 @@ if (!v.keep) rejected += 1;
           { title: row.title, summary: row.summary ?? "", obtain: finalObtain, price: baseEnriched?.price ?? null },
         );
         finalCategory = categoryForSource(row.source_id, finalCategory, hints);
-        const effectiveKeep = kind === "noise" ? false : v.keep;
+        const aiExpiresAt = parseAiExpiry(v.expiresAt);
+        const effectiveExpiresAt = row.expires_at ?? aiExpiresAt;
+        const isExpired = Boolean(effectiveExpiresAt && Date.parse(effectiveExpiresAt) < Date.now());
+        const effectiveKeep = kind === "noise" || isExpired ? false : v.keep;
         const keep = effectiveKeep ? 1 : 0;
         const ai = JSON.stringify({ ...v, keep: effectiveKeep, kind, category: finalCategory, obtain: finalObtain });
         ({ kind, category: finalCategory } = applyManualClassification(row.id, finalCategory, kind));
-        const score = calibrateScoreByObtain(baseScore, finalObtain, effectiveKeep, quality, kind, {
-          title: row.title,
-          summary: row.summary ?? "",
-          publishedAt: row.published_at,
-          sourceId: row.source_id,
-          codes: baseEnriched?.codes ?? [],
-          price: baseEnriched?.price ?? null,
-        });
-        updateAi(row.id, ai, keep, score, finalCategory, finalObtain, kind, quality, priceInfo.price, priceInfo.isFree);
+        const score = isExpired
+          ? 0
+          : calibrateScoreByObtain(baseScore, finalObtain, effectiveKeep, quality, kind, {
+              title: row.title,
+              summary: row.summary ?? "",
+              publishedAt: row.published_at,
+              sourceId: row.source_id,
+              codes: baseEnriched?.codes ?? [],
+              price: baseEnriched?.price ?? null,
+            });
+        updateAi(row.id, ai, keep, score, finalCategory, finalObtain, kind, quality, priceInfo.price, priceInfo.isFree, aiExpiresAt, isExpired);
       }
     }
     finishAiJob(jobId, {

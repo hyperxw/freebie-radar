@@ -1,6 +1,7 @@
 import { config } from "../config.ts";
 import { all } from "../db.ts";
 import { BASE_SITE_KEYWORDS, getCookieSettings, siteKeyOfSource, type CookieSiteKey } from "../cookie-store.ts";
+import { xhsPublishedAtFromUrl } from "../enrich/normalize.ts";
 import type { Collector, RawItem } from "./types.ts";
 
 function keywordsForSite(site: CookieSiteKey, maxKeywords = 4): string[] {
@@ -62,6 +63,18 @@ export const cookieIngestCollector: Collector = {
     }
 
     const keywords = keywordsForSite(site);
+    const maxAgeDays = Math.min(Math.max(Number(ctx.config.maxAgeDays ?? 7) || 7, 1), 60);
+    // 把库里已抓过详情或发布时间的条目传给执行器，避免每轮重复消耗详情预算
+    const knownUrls =
+      site === "xhs"
+        ? all<{ external_id: string }>(
+            `SELECT external_id FROM items
+              WHERE source_id = ?
+                AND ((content IS NOT NULL AND content != '' AND content != '还没有简介') OR published_at IS NOT NULL)
+              ORDER BY id DESC LIMIT 400`,
+            ctx.sourceId,
+          ).map((r) => r.external_id)
+        : [];
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (config.ingestToken) headers.authorization = `Bearer ${config.ingestToken}`;
 
@@ -73,6 +86,8 @@ export const cookieIngestCollector: Collector = {
         cookies,
         keywords,
         proxy: site === "xhs" && settings.xhsProxy ? settings.xhsProxy : "",
+        maxAgeDays,
+        knownUrls,
       }),
       signal: AbortSignal.timeout(240_000),
     });
@@ -89,14 +104,17 @@ export const cookieIngestCollector: Collector = {
       const title = String(it.title ?? "").trim();
       const url = String(it.url ?? "").trim();
       if (!title || !url) continue;
+      const rawContent = typeof it.content === "string" && it.content.trim() && it.content.trim() !== "还没有简介" ? it.content.trim().slice(0, 4000) : null;
+      const rawSummary = String(it.summary ?? "").trim() === "还没有简介" ? "" : String(it.summary ?? "");
+      const publishedAt = it.publishedAt ?? (site === "xhs" ? xhsPublishedAtFromUrl(url) : null);
       items.push({
         externalId: String(it.externalId ?? url),
         url,
         title,
-        summary: String(it.summary ?? ""),
-        content: typeof it.content === "string" && it.content.trim() ? it.content.trim().slice(0, 4000) : null,
+        summary: rawSummary,
+        content: rawContent,
         author: it.author ?? null,
-        publishedAt: it.publishedAt ?? null,
+        publishedAt,
         imageUrl: it.imageUrl ?? null,
         tags: Array.isArray(it.tags) ? it.tags : [site, "cookie-vps"],
         raw: it.raw ?? { site, via: "vps-cookie-runner" },

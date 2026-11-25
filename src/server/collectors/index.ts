@@ -1,6 +1,7 @@
 import { aiEnabled, config, pushEnabled } from "../config.ts";
 import { all, get, run, tx } from "../db.ts";
 import { demoteEditorialGoods, demoteOfflineCategory, enforceFreebieEvidence, enrichItem, FREEBIE_ONLY_SOURCES, isCategory, resolveKind, type Category, type ContentKind } from "../enrich/index.ts";
+import { guessExpiry, xhsPublishedAtFromUrl } from "../enrich/normalize.ts";
 import { calibrateScoreByObtain, resolveDbMergeKey } from "../enrich/alias.ts";
 import { getAiSettings, matchesEntryNoise, shouldPassSourceToAi, shouldReview, type AiVerdict } from "../enrich/ai.ts";
 import { enqueueForAi, reviewFreshNow, setPostReviewHandler } from "../enrich/ai-queue.ts";
@@ -148,9 +149,9 @@ export const SEEDS: SourceSeed[] = [
   { id: "rss-freeflys", name: "FreeFlys · 0元样品", kind: "rss", enabled: true, intervalSec: 3600, config: { kindHint: "freebie", feeds: [{ id: "freeflys", url: "https://www.freeflys.com/feed/", limit: 20 }] } },
 
   // === 登录态站点（VPS Cookie 托管定时采集 / 或本机油猴脚本回传）===
-  { id: "zhihu-search", name: "知乎 · 福利搜索", kind: "ingest", enabled: true, intervalSec: 3600, config: { keyword: "免费领取" } },
-  { id: "xhs-search", name: "小红书 · 福利搜索", kind: "ingest", enabled: true, intervalSec: 3600, config: { keyword: "免费领取" } },
-  { id: "xiaoheihe-search", name: "小黑盒 · 福利搜索", kind: "ingest", enabled: true, intervalSec: 3600, config: { keyword: "免费" } },
+  { id: "zhihu-search", name: "知乎 · 福利搜索", kind: "ingest", enabled: true, intervalSec: 3600, config: { keyword: "免费领取", maxAgeDays: 7 } },
+  { id: "xhs-search", name: "小红书 · 福利搜索", kind: "ingest", enabled: true, intervalSec: 3600, config: { keyword: "免费领取", maxAgeDays: 7 } },
+  { id: "xiaoheihe-search", name: "小黑盒 · 福利搜索", kind: "ingest", enabled: true, intervalSec: 3600, config: { keyword: "免费", maxAgeDays: 7 } },
   // NGA 需登录态 Cookie（ngaPassportUid / ngaPassportCid）：fid=570 优惠信息购物指南，国内羊毛主阵地
   { id: "nga-deals", name: "NGA · 优惠信息购物指南", kind: "nga", enabled: true, intervalSec: 600, config: { fid: 570, forumName: "优惠信息购物指南" } },
   // 570 / 613 / 498 同属「杂谈 > 消费电子 IT新闻 (436)」下的子版；613 拼车拼单、498 二手交易
@@ -327,7 +328,7 @@ async function dispatchFresh(
     const syncBatch = ranked.slice(0, limit);
     const restBatch = ranked.slice(limit);
     const verdicts = await reviewFreshNow(
-      syncBatch.map((f) => ({ itemId: f.id, sourceId, url: f.url, title: f.title, summary: f.summary ?? "", content: f.content ?? null })),
+      syncBatch.map((f) => ({ itemId: f.id, sourceId, url: f.url, title: f.title, summary: f.summary ?? "", content: f.content ?? null, publishedAt: f.publishedAt ?? null })),
     );
     for (const f of syncBatch) {
       const v = verdicts.get(f.id);
@@ -353,6 +354,7 @@ async function dispatchFresh(
           title: f.title,
           summary: f.summary ?? "",
           content: f.content ?? null,
+          publishedAt: f.publishedAt ?? null,
           pushOnApprove: pushSettings.pushAfterBackfill,
         })),
       );
@@ -373,6 +375,7 @@ async function dispatchFresh(
       title: f.title,
       summary: f.summary ?? "",
       content: f.content ?? null,
+      publishedAt: f.publishedAt ?? null,
       pushOnApprove: pushSettings.pushAfterBackfill,
     })),
   );
@@ -559,6 +562,29 @@ export type FreshItem = {
 };
 
 
+const SEARCH_STALE_SOURCES = new Set(["xhs-search", "zhihu-search", "xiaoheihe-search", "weibo-freebies"]);
+
+function maxIngestAgeDaysFor(sourceId: string): number {
+  const row = get<{ config: string }>("SELECT config FROM sources WHERE id = ?", sourceId);
+  if (row?.config) {
+    try {
+      const cfg = JSON.parse(row.config) as { maxAgeDays?: unknown };
+      if (typeof cfg.maxAgeDays === "number" && Number.isFinite(cfg.maxAgeDays) && cfg.maxAgeDays > 0) {
+        return cfg.maxAgeDays;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return SEARCH_STALE_SOURCES.has(sourceId) ? 7 : config.ingestMaxAgeDays;
+}
+
+function isExpiredIso(iso: string | null | undefined, nowMs = Date.now()): boolean {
+  if (!iso) return false;
+  const t = Date.parse(iso);
+  return !Number.isNaN(t) && t < nowMs;
+}
+
 function persist(
   sourceId: string,
   items: RawItem[],
@@ -567,8 +593,12 @@ function persist(
   let inserted = 0;
   const fresh: FreshItem[] = [];
   let skipped = 0;
-  const now = new Date().toISOString();
-  const staleCutoffMs = Date.now() - Math.max(getRetention().keptDays, 7) * 86_400_000;
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  const retentionDays = Math.max(getRetention().keptDays, 7);
+  const ingestAgeDays = Math.min(retentionDays, maxIngestAgeDaysFor(sourceId));
+  const staleCutoffMs = nowMs - ingestAgeDays * 86_400_000;
+  const hardStaleCutoffMs = nowMs - Math.min(retentionDays, 60) * 86_400_000;
   const srcHints = getSourceHints(sourceId);
   tx(() => {
     for (let index = 0; index < items.length; index += 1) {
@@ -653,8 +683,10 @@ const scoreCtx = {
         kind: string | null;
         ai_quality: number | null;
         canonical_id: number | null;
+        expires_at: string | null;
+        published_at: string | null;
       }>(
-        "SELECT id, title, ai_keep, obtain, ai, kind, ai_quality, canonical_id FROM items WHERE source_id = ? AND external_id = ?",
+        "SELECT id, title, ai_keep, obtain, ai, kind, ai_quality, canonical_id, expires_at, published_at FROM items WHERE source_id = ? AND external_id = ?",
         sourceId,
         e.externalId,
       );
@@ -713,7 +745,14 @@ const scoreCtx = {
           } catch { /* preserve malformed legacy AI */ }
         }
         const nextKind = nextClassification.kind;
-        const nextScore = verdict && nextKind === effectiveKind
+        const effectivePubAt = e.publishedAt ?? existing.published_at ?? null;
+        const effectiveExpAt = e.expiresAt ?? existing.expires_at ?? null;
+        const nextStillValid = e.keep && !isExpiredIso(effectiveExpAt, nowMs);
+        const nextStatus = nextStillValid ? "active" : "expired";
+        const existingScoreCtx = { ...scoreCtx, publishedAt: effectivePubAt };
+        const nextScore = !nextStillValid
+          ? 0
+          : verdict && nextKind === effectiveKind
           ? score
           : calibrateScoreByObtain(
               e.baseScore,
@@ -721,11 +760,19 @@ const scoreCtx = {
               existing.ai_keep === null ? null : existing.ai_keep === 1,
               existingQuality,
               nextKind,
-              scoreCtx,
+              existingScoreCtx,
             );
+        const nextSummary = e.summary ?? "";
+        // 已有 published_at 时，仅在采集端明确带了新发布时间时更新，避免无时间重采的 URL 兜底覆盖精确 SSR 时间
+        const incomingPubAt = existing.published_at ? (raw.publishedAt ?? null) : (e.publishedAt ?? null);
         run(
-          `UPDATE items SET url = ?, url_key = ?, title = ?, title_key = ?, summary = ?, author = ?, category = ?,
-             tags = ?, base_score = ?, score = ?, expires_at = ?, published_at = ?, raw = ?, last_seen_at = ?,
+          `UPDATE items SET url = ?, url_key = ?, title = ?, title_key = ?,
+             summary = CASE WHEN ? != '' THEN ? ELSE COALESCE(summary, '') END,
+             author = COALESCE(?, author), category = ?,
+             tags = ?, base_score = ?, score = ?,
+             expires_at = COALESCE(?, expires_at),
+             published_at = COALESCE(?, published_at),
+             raw = ?, last_seen_at = ?,
              price = ?, is_free = ?,
              ai = COALESCE(?, ai),
              obtain = COALESCE(?, obtain),
@@ -740,14 +787,15 @@ const scoreCtx = {
           e.urlKey,
           e.title,
           titleKey,
-          e.summary ?? "",
+          nextSummary,
+          nextSummary,
           e.author ?? null,
           nextClassification.category,
           JSON.stringify(e.tags),
           e.baseScore,
           nextScore,
           e.expiresAt,
-          e.publishedAt ?? null,
+          incomingPubAt,
           JSON.stringify(e.raw ?? {}),
           now,
           e.price,
@@ -759,15 +807,21 @@ const scoreCtx = {
           effectiveQuality,
           e.imageUrl,
           e.content ?? null,
-          status,
+          nextStatus,
           existing.id,
         );
         skipped += 1;
         continue;
       }
+      if (!e.keep) {
+        skipped += 1;
+        continue;
+      }
       if (e.publishedAt) {
         const pubMs = Date.parse(e.publishedAt);
-        if (!Number.isNaN(pubMs) && pubMs < staleCutoffMs) {
+        const hasFutureExpiry = Boolean(e.expiresAt && !Number.isNaN(Date.parse(e.expiresAt)) && Date.parse(e.expiresAt) > nowMs);
+        const cutoff = hasFutureExpiry ? hardStaleCutoffMs : staleCutoffMs;
+        if (!Number.isNaN(pubMs) && pubMs < cutoff) {
           skipped += 1;
           continue;
         }
@@ -987,6 +1041,77 @@ export function addCustomRssSource(input: {
     new Date().toISOString(),
   );
   return id;
+}
+
+const BACKFILL_KEY = "backfill_xhs_expiry_v1";
+
+/**
+ * 一次性历史回填（幂等，写入 settings 标记后不再重复全表扫描）：
+ * 1) 清理小红书占位正文「还没有简介」
+ * 2) 从小红书笔记 URL（24 位十六进制 ID）补齐缺失的 published_at
+ * 3) 用新版 guessExpiry 重扫未标截止时间的 active 条目，已过期直接标 expired
+ */
+export function backfillXhsAndExpiry(opts: { force?: boolean } = {}): {
+  cleanedPlaceholder: number;
+  xhsBackfilled: number;
+  expiryUpdated: number;
+  expiredMarked: number;
+} {
+  if (!opts.force && get<{ value: string }>("SELECT value FROM settings WHERE key = ?", BACKFILL_KEY)) {
+    return { cleanedPlaceholder: 0, xhsBackfilled: 0, expiryUpdated: 0, expiredMarked: 0 };
+  }
+  let cleanedPlaceholder = 0;
+  let xhsBackfilled = 0;
+  let expiryUpdated = 0;
+  let expiredMarked = 0;
+  const nowMs = Date.now();
+
+  tx(() => {
+    const c1 = run("UPDATE items SET content = NULL WHERE content = '还没有简介'");
+    const c2 = run("UPDATE items SET summary = '' WHERE summary = '还没有简介'");
+    cleanedPlaceholder = Number(c1.changes) + Number(c2.changes);
+
+    const xhsRows = all<{ id: number; url: string; first_seen_at: string }>(
+      "SELECT id, url, first_seen_at FROM items WHERE source_id = 'xhs-search' AND published_at IS NULL",
+    );
+    for (const r of xhsRows) {
+      const refMs = Date.parse(r.first_seen_at);
+      const pub = xhsPublishedAtFromUrl(r.url, Number.isFinite(refMs) ? refMs : nowMs);
+      if (!pub) continue;
+      run("UPDATE items SET published_at = ? WHERE id = ?", pub, r.id);
+      xhsBackfilled += 1;
+    }
+
+    const activeRows = all<{
+      id: number;
+      title: string;
+      summary: string | null;
+      content: string | null;
+      published_at: string | null;
+    }>("SELECT id, title, summary, content, published_at FROM items WHERE status = 'active' AND expires_at IS NULL");
+    for (const r of activeRows) {
+      const exp =
+        guessExpiry(`${r.title} ${r.summary ?? ""}`, r.published_at, nowMs) ||
+        (r.content ? guessExpiry(r.content, r.published_at, nowMs) : null);
+      if (!exp) continue;
+      if (Date.parse(exp) < nowMs) {
+        run("UPDATE items SET expires_at = ?, status = 'expired', score = 0 WHERE id = ?", exp, r.id);
+        expiredMarked += 1;
+      } else {
+        run("UPDATE items SET expires_at = ? WHERE id = ?", exp, r.id);
+      }
+      expiryUpdated += 1;
+    }
+
+    run(
+      "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      BACKFILL_KEY,
+      JSON.stringify({ cleanedPlaceholder, xhsBackfilled, expiryUpdated, expiredMarked }),
+      new Date(nowMs).toISOString(),
+    );
+  });
+
+  return { cleanedPlaceholder, xhsBackfilled, expiryUpdated, expiredMarked };
 }
 
 export function deleteCustomSource(id: string): { ok: true } | { ok: false; error: string } {

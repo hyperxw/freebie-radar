@@ -11,6 +11,7 @@ import { categoryForSource } from "../../shared/source-classification.ts";
 import { isSharedResource } from "./evidence.ts";
 import { readEvidence, shouldQueueForReview } from "./classify.ts";
 import { extractPrice } from "./pricing.ts";
+import { parseAiExpiry } from "./normalize.ts";
 
 const VALID_OBTAIN = new Set(["free", "conditional", "lottery", "trial", "promo", "paid"]);
 
@@ -36,6 +37,7 @@ export type AiQueueJob = {
   title: string;
   summary: string;
   content?: string | null;
+  publishedAt?: string | null;
   pushOnApprove?: boolean;
 };
 
@@ -100,13 +102,14 @@ function applyVerdictToItem(itemId: number, verdict: AiVerdict): AppliedVerdict 
       is_free: number;
       price: number | null;
       published_at: string | null;
+      expires_at: string | null;
       codes: string | null;
       content: string | null;
       url: string;
       tags: string | null;
       status: string;
     }>(
-      "SELECT score, base_score, ai_keep, obtain, category, title, summary, source_id, is_free, price, published_at, codes, content, url, tags, status FROM items WHERE id = ?",
+      "SELECT score, base_score, ai_keep, obtain, category, title, summary, source_id, is_free, price, published_at, expires_at, codes, content, url, tags, status FROM items WHERE id = ?",
       itemId,
     );
     if (!cur) return null;
@@ -149,7 +152,10 @@ function applyVerdictToItem(itemId: number, verdict: AiVerdict): AppliedVerdict 
       { title: cur?.title ?? "", summary: cur?.summary ?? "", obtain: finalObtain, price: cur?.price ?? null },
     ), hints);
     const { kind: effectiveKind, category: effectiveCategory } = applyManualClassification(itemId, autoCategory, finalKind);
-    const effectiveKeep = finalKind === "noise" ? false : verdict.keep;
+    const aiExpiresAt = parseAiExpiry(verdict.expiresAt);
+    const effectiveExpiresAt = cur.expires_at ?? aiExpiresAt;
+    const isExpired = Boolean(effectiveExpiresAt && Date.parse(effectiveExpiresAt) < Date.now());
+    const effectiveKeep = finalKind === "noise" || isExpired ? false : verdict.keep;
     // AI 说是福利、证据里却没有任何可领取对象（领取动作/赠送/兑换码/权益/项目）时不上公开站：
     // 这正是「讨论帖判 freebie」那批幻觉的特征。进 review 等人工看一眼，不直接丢也不直接发。
     // 已有人工分类的条目以人工为准，不进队列。
@@ -173,10 +179,13 @@ function applyVerdictToItem(itemId: number, verdict: AiVerdict): AppliedVerdict 
       evidence,
     });
     let nextStatus = cur.status;
-    if (cur.status === "active" && needsReview) nextStatus = "review";
+    if (isExpired && cur.status !== "ignored") nextStatus = "expired";
+    else if (cur.status === "active" && needsReview) nextStatus = "review";
     else if (cur.status === "review" && !needsReview) nextStatus = effectiveKeep ? "active" : "ignored";
     const keep = effectiveKeep ? 1 : 0;
-    const nextScore = cur
+    const nextScore = isExpired
+      ? 0
+      : cur
       ? calibrateScoreByObtain(
           cur.base_score ?? cur.score,
           finalObtain,
@@ -188,7 +197,7 @@ function applyVerdictToItem(itemId: number, verdict: AiVerdict): AppliedVerdict 
             summary: cur.summary ?? "",
             publishedAt: cur.published_at ?? null,
             sourceId: cur.source_id,
-codes: parseCodes(cur.codes),
+            codes: parseCodes(cur.codes),
             price: priceInfo.price,
           },
         )
@@ -209,6 +218,7 @@ codes: parseCodes(cur.codes),
               ai_quality = COALESCE(?, ai_quality),
               obtain = COALESCE(?, obtain),
               category = COALESCE(?, category),
+              expires_at = COALESCE(expires_at, ?),
               score = ?,
               price = ?,
               is_free = ?,
@@ -222,6 +232,7 @@ codes: parseCodes(cur.codes),
       nextQuality,
       finalObtain,
       effectiveCategory,
+      aiExpiresAt,
       nextScore,
       priceInfo.price,
       priceInfo.isFree ? 1 : 0,
@@ -254,6 +265,7 @@ export async function reviewFreshNow(items: AiQueueJob[]): Promise<Map<number, A
     title: j.title,
     summary: j.summary,
     content: j.content ?? null,
+    publishedAt: j.publishedAt ?? null,
   })) as RawItem[];
   const srcId = items[0]?.sourceId;
   const jobId = startAiJob({
@@ -342,6 +354,7 @@ async function drain(): Promise<void> {
         title: j.title,
         summary: j.summary,
         content: j.content ?? null,
+        publishedAt: j.publishedAt ?? null,
       })) as RawItem[];
 
       const jobId = startAiJob({

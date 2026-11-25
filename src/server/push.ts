@@ -447,9 +447,14 @@ export function checkPushFilter(
     category?: string | null;
     obtain?: string | null;
     publishedAt?: string | null;
+    expiresAt?: string | null;
   },
   s: PushSettings,
 ): FilterRejectReason | null {
+  if (item.expiresAt) {
+    const expMs = Date.parse(item.expiresAt);
+    if (!Number.isNaN(expMs) && expMs < Date.now()) return "stale";
+  }
   if (!freshEnoughForPush(item.publishedAt, s.maxAgeHours)) return "stale";
   if (!sourceAllowed(item.sourceId, s)) return "source";
   if (!langAllowed(item, s)) return "lang";
@@ -482,6 +487,7 @@ export function passesPushFilters(
     category?: string | null;
     obtain?: string | null;
     publishedAt?: string | null;
+    expiresAt?: string | null;
   },
   s: PushSettings,
 ): boolean {

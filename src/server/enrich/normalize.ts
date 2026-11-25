@@ -81,21 +81,144 @@ export function parseDate(input: string | number | null | undefined): string | n
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** 从文本里抽取「截止/有效期」类日期，用于过期降权。 */
-export function guessExpiry(text: string): string | null {
-  const now = Date.now();
-  const m = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/.exec(text);
-  if (m) {
-    // 正文里写了年份就用年份：否则「2020 年的 7 月 13 日活动」会被推到明年，
-    // 让一条几年前的旧帖长期挂着有效期。
-    const stated = /(20\d{2})\s*年/.exec(text);
-    const year = stated ? Number(stated[1]) : new Date().getFullYear();
-    const d = new Date(year, Number(m[1]) - 1, Number(m[2]), 23, 59, 59);
-    if (!stated && d.getTime() < now - 86_400_000) d.setFullYear(year + 1);
-    return d.toISOString();
+const XHS_NOTE_ID_RE = /xiaohongshu\.com\/(?:explore|search_result|discovery\/item)\/([0-9a-f]{24})(?:$|[/?#])/i;
+const MIN_XHS_TS_SEC = 1_420_070_400; // 2015-01-01T00:00:00Z
+
+/** 从小红书 24 位十六进制笔记 ID 前 8 位解码秒级创建时间，作发布时间兜底。 */
+export function xhsPublishedAtFromUrl(url: string, nowMs = Date.now()): string | null {
+  const m = XHS_NOTE_ID_RE.exec(url);
+  if (!m) return null;
+  const sec = Number.parseInt(m[1]!.slice(0, 8), 16);
+  if (!Number.isFinite(sec) || sec < MIN_XHS_TS_SEC) return null;
+  const ms = sec * 1000;
+  if (ms > nowMs + 86_400_000) return null;
+  return new Date(ms).toISOString();
+}
+
+function buildEndDate(year: number, month: number, day: number, zeroHour = false): Date | null {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = zeroHour
+    ? new Date(year, month - 1, day, 0, 0, 0)
+    : new Date(year, month - 1, day, 23, 59, 59);
+  if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null;
+  return d;
+}
+
+function resolveExpiryDate(
+  month: number,
+  day: number,
+  explicitYear: number | undefined,
+  refMs: number,
+  zeroHour = false,
+  pastStatedYear?: number,
+): Date | null {
+  const year = explicitYear ?? pastStatedYear;
+  if (year !== undefined) {
+    return buildEndDate(year, month, day, zeroHour);
   }
-  const rel = /(\d+)\s*(天|日)\s*(?:内|后)?(?:有效|截止|过期)/.exec(text);
-  if (rel) return new Date(now + Number(rel[1]) * 86_400_000).toISOString();
+  const refYear = new Date(refMs).getFullYear();
+  const d = buildEndDate(refYear, month, day, zeroHour);
+  if (!d) return null;
+  // 仅当写明的月日比参考时间早超过半年（如 12 月发帖写 1 月截止）才顺延到下一年，
+  // 避免把刚过期几天的「11.22」误判成明年。
+  if (d.getTime() < refMs - 180 * 86_400_000) {
+    return buildEndDate(refYear + 1, month, day, zeroHour);
+  }
+  return d;
+}
+
+/** 规范化 AI 返回的截止日期（支持 YYYY-MM-DD 按当天 23:59:59 算或完整 ISO）。 */
+export function parseAiExpiry(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+  const ymd = /^(20\d{2})-(\d{1,2})-(\d{1,2})$/.exec(s);
+  if (ymd) {
+    const d = buildEndDate(Number(ymd[1]), Number(ymd[2]), Number(ymd[3]));
+    return d ? d.toISOString() : null;
+  }
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+const CN_RANGE_RE =
+  /(?:(20\d{2})\s*[年./-]\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?\s*(?:[-~～至到]|——)\s*(?:(20\d{2})\s*[年./-]\s*)?(?:(\d{1,2})\s*月\s*)?(\d{1,2})\s*[日号]?(?!\s*[亿万元块刀%折倍])/;
+const NUM_RANGE_RE =
+  /(?<![\d.vV])(?:(20\d{2})\s*([./-])\s*)?(\d{1,2})\s*([./-])\s*(\d{1,2})\s*([-~～至到]|——)\s*(?:(20\d{2})\s*[./-]\s*)?(?:(\d{1,2})\s*[./-]\s*)?(\d{1,2})(?![\d.])(?!\s*[亿万元块刀%折倍])/;
+const EXPIRY_BEFORE_RE =
+  /(?:截止|截至|到期|结束|过期|有效期(?:至|到)?|有效至|活动(?:时间)?至|\bends?\b|\buntil\b|\bexpires?\b|\bvalid\s*(?:thru|through|until))\s*(?:时间|日期|于)?\s*[：:为到至]?\s*(?:(20\d{2})\s*[-./年]\s*)?(\d{1,2})\s*(?:[-./月])\s*(\d{1,2})\s*[日号]?(?![\d.])(?!\s*[亿万元块刀%折倍])/i;
+const EXPIRY_AFTER_RE =
+  /(?<![\d.])(?:(20\d{2})\s*[-./年]\s*)?(\d{1,2})\s*(?:[-./月])\s*(\d{1,2})\s*[日号]?(?!\s*[亿万元块刀%折倍])\s*(?:晚\s*)?(?:([0零]点)|(?:\d{1,2}\s*[:：]\s*\d{2}|\d{1,2}\s*点))?\s*(?:前|之前|以前|左右)?\s*(?:就|已|已经)?\s*(?:截止|截至|到期|结束|过期|有效|下线|停止|失效)/i;
+const REL_EXPIRY_RE = /(\d+)\s*(天|日)\s*(?:内|后)?(?:有效|截止|过期)/;
+
+/** 从文本里抽取「截止/有效期」类日期，结合发布时间推断年份与过期时刻。 */
+export function guessExpiry(text: string, publishedAt?: string | null, nowMs = Date.now()): string | null {
+  if (!text) return null;
+  const pubRaw = publishedAt ? Date.parse(publishedAt) : Number.NaN;
+  const pubMs = Number.isFinite(pubRaw) ? pubRaw : null;
+  const refMs = pubMs ?? nowMs;
+  // 若正文写了往年年份（如「2020 年的 7 月 13 日活动」），优先采用该往年年份
+  const statedM = /(20\d{2})\s*年/.exec(text);
+  const statedYear = statedM ? Number(statedM[1]) : undefined;
+  const pastStatedYear =
+    statedYear !== undefined && statedYear < new Date(refMs).getFullYear() ? statedYear : undefined;
+
+  const before = EXPIRY_BEFORE_RE.exec(text);
+  if (before) {
+    const y = before[1] ? Number(before[1]) : undefined;
+    const d = resolveExpiryDate(Number(before[2]), Number(before[3]), y, refMs, false, pastStatedYear);
+    if (d) return d.toISOString();
+  }
+
+  const after = EXPIRY_AFTER_RE.exec(text);
+  if (after) {
+    const y = after[1] ? Number(after[1]) : undefined;
+    const d = resolveExpiryDate(Number(after[2]), Number(after[3]), y, refMs, Boolean(after[4]), pastStatedYear);
+    if (d) return d.toISOString();
+  }
+
+  const cnRange = CN_RANGE_RE.exec(text);
+  if (cnRange) {
+    const startOk = buildEndDate(Number(cnRange[1] ?? new Date(refMs).getFullYear()), Number(cnRange[2]), Number(cnRange[3]));
+    if (startOk) {
+      const y = cnRange[4] ? Number(cnRange[4]) : cnRange[1] ? Number(cnRange[1]) : undefined;
+      const month = Number(cnRange[5] ?? cnRange[2]);
+      const day = Number(cnRange[6]);
+      if (cnRange[5] || day >= Number(cnRange[3])) {
+        const d = resolveExpiryDate(month, day, y, refMs, false, pastStatedYear);
+        if (d) return d.toISOString();
+      }
+    }
+  }
+
+  const numRange = NUM_RANGE_RE.exec(text);
+  if (numRange) {
+    const sep = numRange[4]!;
+    const rangeSep = numRange[6]!;
+    // 11-15-22 这类纯短横线容易与编号/电话混淆；日期用 - 时要求连接符为 ~ / ～ / 至 / 到 / ——
+    const validRange = sep !== "-" || rangeSep !== "-";
+    if (validRange) {
+      const startOk = buildEndDate(Number(numRange[1] ?? new Date(refMs).getFullYear()), Number(numRange[3]), Number(numRange[5]));
+      if (startOk) {
+        const y = numRange[7] ? Number(numRange[7]) : numRange[1] ? Number(numRange[1]) : undefined;
+        const month = Number(numRange[8] ?? numRange[3]);
+        const day = Number(numRange[9]);
+        if (numRange[8] || day >= Number(numRange[5])) {
+          const d = resolveExpiryDate(month, day, y, refMs, false, pastStatedYear);
+          if (d) return d.toISOString();
+        }
+      }
+    }
+  }
+
+  const rel = REL_EXPIRY_RE.exec(text);
+  if (rel) {
+    const days = Number(rel[1]);
+    if (Number.isFinite(days) && days > 0 && days <= 3650) {
+      return new Date(refMs + days * 86_400_000).toISOString();
+    }
+  }
   return null;
 }
 

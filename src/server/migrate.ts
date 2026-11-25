@@ -1,6 +1,7 @@
 import { migrate, dbPath } from "./db.ts";
-import { ensureSources } from "./collectors/index.ts";
+import { backfillXhsAndExpiry, ensureSources } from "./collectors/index.ts";
 
 const version = migrate();
 ensureSources();
-console.log(`[migrate] schema v${version} ready at ${dbPath()}`);
+const bf = backfillXhsAndExpiry();
+console.log(`[migrate] schema v${version} ready at ${dbPath()} (backfill: xhs=${bf.xhsBackfilled}, exp=${bf.expiryUpdated})`);

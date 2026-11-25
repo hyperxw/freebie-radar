@@ -23,6 +23,8 @@ export type AiVerdict = {
   quality?: number;
   /** 检索用短标签（品牌/平台/品类），不参与频道路由；缺省表示模型没给 */
   tags?: string[];
+  /** 可选：AI 从标题/正文提取的活动截止日期（YYYY-MM-DD 或 ISO） */
+  expiresAt?: string | null;
 };
 
 export type AiSourceMode = "all" | "exclude" | "only";
@@ -302,6 +304,8 @@ export function publicAiSettings(s = getAiSettings()) {
 }
 
 function buildSystemPrompt(s: AiSettings): string {
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   const custom = s.systemPrompt.trim();
   const parts: string[] = [custom || DEFAULT_PROMPT];
   // 自定义/云端 system prompt 也要补分类清单，否则模型不知道 category 能取哪些值
@@ -309,6 +313,10 @@ function buildSystemPrompt(s: AiSettings): string {
   if (s.extraPrompt.trim()) {
     parts.push("", "补充审核规则（务必优先遵守）：", s.extraPrompt.trim());
   }
+  parts.push(
+    "",
+    `当前日期：${today}。时效规则：若标题或正文写明活动截止/结束日期已早于当前日期（或发布时间已过时效），判 keep=false、kind="noise"、reason="活动已过期"；若文中提到明确截止日期，可附带 "expiresAt":"YYYY-MM-DD"。`,
+  );
   parts.push("", CLASSIFICATION_PROMPT);
   if (!s.learnFromFeedback) return parts.join("\n");
   try {
@@ -431,7 +439,11 @@ export async function reviewItems(
   const merged = new Map<number, AiVerdict>();
   let ok = 0;
 
-  type Job = { start: number; chunk: RawItem[]; payload: { index: number; title: string; summary: string }[] };
+  type Job = {
+    start: number;
+    chunk: RawItem[];
+    payload: { index: number; title: string; summary: string; publishedAt?: string }[];
+  };
   const jobs: Job[] = [];
   for (let start = 0; start < total; start += s.batchSize) {
     const chunk = items.slice(start, Math.min(start + s.batchSize, total));
@@ -442,6 +454,7 @@ export async function reviewItems(
         index: start + i,
         title: (it.title ?? "").slice(0, 140),
         summary: aiSummaryExcerpt(it),
+        ...(it.publishedAt ? { publishedAt: it.publishedAt.slice(0, 10) } : {}),
       })),
     });
   }

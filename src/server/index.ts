@@ -15,7 +15,7 @@ import { startPromptSync } from "./enrich/prompt-sync.ts";
 import { digestExists, runDaily } from "./digest.ts";
 import { startIntervalScheduler, startScheduler } from "./cron.ts";
 import { getRetention, runCleanup } from "./retention.ts";
-import { ensureSources } from "./collectors/index.ts";
+import { backfillXhsAndExpiry, ensureSources } from "./collectors/index.ts";
 import { releaseFlareSession } from "./flaresolverr.ts";
 import { pushUserDaily, startUserPushScheduler } from "./user-push.ts";
 import { purgeExpiredSessions } from "./auth.ts";
@@ -27,6 +27,10 @@ migrate();
 ensureSources();
 const rerouted = reconcileFixedSourceCategories();
 if (rerouted) console.log(`[sources] 固定分类已重整 ${rerouted} 条历史资源（未触发 AI 或推送）`);
+const bf = backfillXhsAndExpiry();
+if (bf.xhsBackfilled || bf.expiryUpdated || bf.cleanedPlaceholder) {
+  console.log(`[backfill] 历史回填：小红书发布时间 ${bf.xhsBackfilled} 条，过期识别 ${bf.expiryUpdated} 条（已过期 ${bf.expiredMarked}），清理占位符 ${bf.cleanedPlaceholder} 条`);
+}
 // 上次进程意外退出可能遗留 status='running' 的记录，启动时收口
 run(
   "UPDATE runs SET status = 'failed', finished_at = ?, error = COALESCE(error, '进程重启中断') WHERE status = 'running'",

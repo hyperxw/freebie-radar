@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { classify, demoteOfflineCategory, enrichItem, isOfflineWorthy, scoreItem } from "../src/server/enrich/index.ts";
-import { cleanText, guessExpiry, normalizeUrl, parseDate, urlKey } from "../src/server/enrich/normalize.ts";
+import { cleanText, guessExpiry, normalizeUrl, parseDate, urlKey, xhsPublishedAtFromUrl } from "../src/server/enrich/normalize.ts";
 
 test("URL 规范化：追踪参数、片段、尾斜杠都不影响去重键", () => {
   const a = "https://Example.com/deal/1?utm_source=x&utm_medium=y&b=2#top";
@@ -120,10 +120,87 @@ test("时间解析：秒级时间戳与 RFC822", () => {
   assert.equal(parseDate("not a date"), null);
 });
 
-test("过期推断：识别月日与相对天数", () => {
+test("过期推断：识别月日、点号日期、区间、相对天数，且不把刚过期的活动顺延到明年", () => {
   assert.ok(guessExpiry("活动截止 12 月 31 日"));
   assert.ok(guessExpiry("3 天内有效"));
   assert.equal(guessExpiry("没有任何日期"), null);
+
+  const nowMs = Date.parse("2026-11-25T06:00:00Z");
+  const pubNov16 = "2026-11-16T08:12:02Z";
+
+  // 活动在 11.22 过期：11.25 查看必须识别为 2026-11-22（已过期），绝不能顺延成 2027 年
+  const exp1 = guessExpiry("智谱送Token，活动在11.22就过期了", pubNov16, nowMs);
+  assert.ok(exp1);
+  assert.equal(new Date(exp1).getFullYear(), 2026);
+  assert.equal(new Date(exp1).getMonth(), 10);
+  assert.equal(new Date(exp1).getDate(), 22);
+  assert.ok(Date.parse(exp1) < nowMs);
+
+  // 区间写法 11.15-11.22 取结束日期
+  const expRange = guessExpiry("活动时间 11.15-11.22", pubNov16, nowMs);
+  assert.ok(expRange);
+  assert.equal(new Date(expRange).getDate(), 22);
+  assert.ok(Date.parse(expRange) < nowMs);
+
+  // 即使不传 publishedAt，3 天前的 11 月 22 日也不会顺延到明年
+  const expNoPub = guessExpiry("活动截止 11 月 22 日", null, nowMs);
+  assert.ok(expNoPub && Date.parse(expNoPub) < nowMs);
+
+  // 跨年场景：12 月发帖写 1 月 5 日截止 → 正确顺延到 2027 年
+  const expCrossYear = guessExpiry("活动1月5日截止", "2026-12-20T08:00:00Z", Date.parse("2026-12-21T00:00:00Z"));
+  assert.ok(expCrossYear);
+  assert.equal(new Date(expCrossYear).getFullYear(), 2027);
+  assert.equal(new Date(expCrossYear).getMonth(), 0);
+  assert.equal(new Date(expCrossYear).getDate(), 5);
+
+  // 相对天数基于 publishedAt 计算，10 天前发的「3天内有效」必须过期
+  const expRel = guessExpiry("3天内有效", pubNov16, nowMs);
+  assert.ok(expRel && Date.parse(expRel) < nowMs);
+
+  // 非截止日期与价格数字不得误判
+  assert.equal(guessExpiry("【黑五】11.14 现车更新：RackNerd", pubNov16, nowMs), null);
+  assert.equal(guessExpiry("智谱再送1.5亿Token，仅售10.99元", pubNov16, nowMs), null);
+});
+
+test("小红书 URL 时间戳兜底与 enrichItem 占位符清理", () => {
+  const nowMs = Date.parse("2026-11-25T06:00:00Z");
+  // 6afabad2 对应 2026-11-16T08:12:02.000Z
+  assert.equal(
+    xhsPublishedAtFromUrl("https://www.xiaohongshu.com/explore/6afabad2000000002a00d0d4", nowMs),
+    "2026-11-16T08:12:02.000Z",
+  );
+  assert.equal(xhsPublishedAtFromUrl("https://www.xiaohongshu.com/explore/abc123", nowMs), null);
+
+  const enriched = enrichItem(
+    {
+      externalId: "https://www.xiaohongshu.com/explore/6afabad2000000002a00d0d4",
+      url: "https://www.xiaohongshu.com/explore/6afabad2000000002a00d0d4",
+      title: "智谱再送1.5亿Token",
+      summary: "还没有简介",
+      content: "还没有简介",
+      publishedAt: null,
+    },
+    "xhs-search",
+  );
+  assert.ok(enriched);
+  assert.equal(enriched.publishedAt, "2026-11-16T08:12:02.000Z");
+  assert.equal(enriched.summary, "");
+  assert.equal(enriched.content, null);
+
+  // 截止日期落在长正文尾部也能被识别为已过期
+  const expiredByContent = enrichItem(
+    {
+      externalId: "https://example.com/long",
+      url: "https://example.com/long",
+      title: "智谱再送1.5亿Token",
+      summary: "",
+      content: "这是一段很长的活动说明……".repeat(30) + "，本次活动2025-11-22截止。",
+    },
+    "xhs-search",
+  );
+  assert.ok(expiredByContent);
+  assert.equal(expiredByContent.keep, false);
+  assert.equal(expiredByContent.score, 0);
 });
 
 test("AI 二审关闭时（默认配置）全链路正常出结果", () => {

@@ -45,6 +45,8 @@ export const config = {
     .map((s) => s.trim())
     .filter(Boolean),
   maxItemsPerRun: num("MAX_ITEMS_PER_RUN", 50),
+  /** 未提供未来截止时间的条目，超过该发布天数后不再作为新内容入库 */
+  ingestMaxAgeDays: num("INGEST_MAX_AGE_DAYS", 14),
 
   githubToken: str("GITHUB_TOKEN"),
 

@@ -11,6 +11,7 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { collectXhsNotes } from "./lib/xhs.mjs";
 
 try { process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url))); } catch { /* 没有 .env 时忽略 */ }
 
@@ -136,40 +137,13 @@ async function collectZhihu(page, keywords, server, token) {
 }
 
 async function collectXhs(page, keywords, server, token) {
-  const seen = new Map();
-  for (const kw of keywords.xhs) {
-    await page.goto("https://www.xiaohongshu.com/search_result?keyword=" + encodeURIComponent(kw) + "&source=web_search_result_notes", { waitUntil: "domcontentloaded" });
-    await sleep(3500);
-    await page.locator("text=最新").first().click({ timeout: 2000 }).catch(() => {});
-    await sleep(1500);
-    for (let i = 0; i < 3; i += 1) {
-      await page.mouse.wheel(0, 1800);
-      await sleep(1200);
-    }
-    const state = await page.evaluate(() => ({
-      needLogin: /登录后查看搜索结果/.test(document.body.innerText || ""),
-      items: Array.from(document.querySelectorAll("section.note-item")).map((c) => {
-        const a = c.querySelector('a.cover, a[href*="/explore/"], a[href*="/search_result/"]');
-        const t = c.querySelector(".title span, .footer .title, .title");
-        const au = c.querySelector(".author .name, .name");
-        return {
-          title: ((t && t.textContent) || "").trim(),
-          url: (a && a.href) || "",
-          author: ((au && au.textContent) || "").trim(),
-        };
-      }).filter((x) => x.title && x.url),
-    }));
-    console.log("[xhs]", kw, "needLogin=", state.needLogin, "->", state.items.length);
-    if (state.needLogin) {
-      return reportFailure(server, token, "xhs-search", "登录态失效：搜索页出现「登录后查看搜索结果」", "degraded");
-    }
-    for (const it of state.items) if (!seen.has(it.url)) seen.set(it.url, it);
-  }
-  return push(server, token, "xhs-search", [...seen.values()].map((x) => ({
-    externalId: x.url, url: x.url, title: x.title, summary: "",
-    author: x.author || null, publishedAt: null,
-    tags: ["xiaohongshu", "playwright"], raw: { site: "xhs" },
-  })));
+  const items = await collectXhsNotes(page, keywords.xhs, {
+    maxAgeDays: Number(process.env.XHS_MAX_AGE_DAYS || 7),
+    detailBudget: Number(process.env.XHS_DETAIL_BUDGET || 24),
+    tag: "playwright",
+    log: (m) => console.log("[xhs]", m),
+  });
+  return push(server, token, "xhs-search", items);
 }
 
 async function collectXiaoheihe(page, keywords, server, token) {

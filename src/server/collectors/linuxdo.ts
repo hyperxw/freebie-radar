@@ -1,5 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
-import { flaresolverrGet, hasFlare } from "../flaresolverr.ts";
+import { FlareUnavailableError, flaresolverrGet, hasFlare } from "../flaresolverr.ts";
 import { cleanText, extractImageFromHtml, parseDate } from "../enrich/normalize.ts";
 import type { Collector, RawItem } from "./types.ts";
 
@@ -93,7 +93,7 @@ export class RateLimited extends Error {
   }
 }
 
-async function fetchRss(ctx: Ctx, url: string): Promise<string> {
+async function fetchRss(ctx: Ctx, url: string, allowFlare = true): Promise<string> {
   let lastStatus = 0;
   let lastName = "";
   try {
@@ -109,16 +109,18 @@ async function fetchRss(ctx: Ctx, url: string): Promise<string> {
       throw new RateLimited("HTTP 429 限流，本轮跳过");
     }
     lastStatus = res.status;
-    ctx.log(`直连 RSS HTTP ${res.status}，切 FlareSolverr`);
+    ctx.log(`直连 RSS HTTP ${res.status}${allowFlare ? "，切 FlareSolverr" : ""}`);
   } catch (err) {
     if (err instanceof RateLimited) throw err;
     lastName = err instanceof Error ? err.message : String(err);
-    ctx.log(`直连 RSS 失败（${lastName}），切 FlareSolverr`);
+    ctx.log(`直连 RSS 失败（${lastName}）${allowFlare ? "，切 FlareSolverr" : ""}`);
   }
 
-  if (!hasFlare()) {
+  if (!allowFlare || !hasFlare()) {
     throw new Error(
-      lastName ? `直连失败（${lastName}）且未配置 FLARESOLVERR_URL` : `直连 HTTP ${lastStatus} 且未配置 FLARESOLVERR_URL`,
+      lastName
+        ? `直连失败（${lastName}）${allowFlare ? "且未配置 FLARESOLVERR_URL" : "（本轮已跳过 FlareSolverr 二次兜底）"}`
+        : `直连 HTTP ${lastStatus} ${allowFlare ? "且未配置 FLARESOLVERR_URL" : "（本轮已跳过 FlareSolverr 二次兜底）"}`,
     );
   }
   const res = await flaresolverrGet(url);
@@ -143,6 +145,7 @@ export const linuxdoCollector: Collector = {
 
     let items: RawItem[] = [];
     let degraded: string | null = null;
+    let flareFailed = false;
 
     // 1) 分类 RSS：精准，只有目标板块
     if (cfg.rssSlug) {
@@ -158,7 +161,11 @@ export const linuxdoCollector: Collector = {
           ctx.log(`${err.message}（本轮直接结束，不回落）`);
           return { items: [], cursor: ctx.cursor, degraded: err.message };
         }
-        degraded = "分类 RSS 失败: " + (err instanceof Error ? err.message : String(err));
+        const msg = err instanceof Error ? err.message : String(err);
+        if (err instanceof FlareUnavailableError || /FlareSolverr|TimeoutError|AbortError|session/i.test(msg)) {
+          flareFailed = true;
+        }
+        degraded = "分类 RSS 失败: " + msg;
         ctx.log(degraded);
       }
     }
@@ -166,7 +173,7 @@ export const linuxdoCollector: Collector = {
     // 2) 兜底：latest.rss + 按 category 过滤（只有最新 30 条，覆盖全部板块）
     if (!items.length) {
       try {
-        const xml = await fetchRss(ctx as Ctx, "https://linux.do/latest.rss");
+        const xml = await fetchRss(ctx as Ctx, "https://linux.do/latest.rss", !flareFailed);
         const all = parseRss(xml);
         const filtered = cfg.categoryName ? all.filter((it) => textOf(it.category).trim() === cfg.categoryName) : all;
         items = filtered.map((it) => toRawItem(it, cfg.categoryName)).filter((x): x is RawItem => x !== null);

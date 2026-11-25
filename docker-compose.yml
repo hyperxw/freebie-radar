@@ -5,7 +5,11 @@ services:
     # 需要从源码构建时执行 docker compose up -d --build，构建产物同样打这个标签。
     image: ${RADAR_IMAGE:-zichuanlan/freebie-radar:latest}
     restart: unless-stopped
-    mem_limit: 256m
+    init: true
+    cpus: 1.0
+    mem_limit: 320m
+    memswap_limit: 320m
+    pids_limit: 64
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8788}:8788"
     security_opt:
@@ -17,6 +21,7 @@ services:
       HOST: "0.0.0.0"
       DATABASE_PATH: /data/radar.db
       TZ: ${TZ:-Asia/Shanghai}
+      COOKIE_RUNNER_URL: ${COOKIE_RUNNER_URL:-http://host.docker.internal:18790}
     env_file:
       - path: .env
         required: false
@@ -41,10 +46,17 @@ services:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     profiles: ["cf"]
     restart: unless-stopped
-    mem_limit: 400m
+    # init=true 自动回收 Chromium 僵尸子进程；硬限制 1 核 CPU、禁止 Swap 并提供足够 shm，防止 OOM 换页拖垮宿主机
+    init: true
+    cpus: 1.0
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    shm_size: 256m
+    pids_limit: 256
     environment:
       LOG_LEVEL: info
       TZ: ${TZ:-Asia/Shanghai}
+      BROWSER_TIMEOUT: "45000"
     logging:
       driver: json-file
       options:

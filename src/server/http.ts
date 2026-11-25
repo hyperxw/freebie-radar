@@ -26,6 +26,46 @@ export type HttpClient = {
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const DEFAULT_ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8";
+const DEFAULT_ACCEPT =
+  "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8";
+
+function mergeHeaders(base: Record<string, string>, overrides?: Record<string, string>): Record<string, string> {
+  const byLower = new Map<string, [string, string]>();
+  for (const [k, v] of Object.entries(base)) byLower.set(k.toLowerCase(), [k, v]);
+  for (const [k, v] of Object.entries(overrides ?? {})) byLower.set(k.toLowerCase(), [k, v]);
+  return Object.fromEntries(byLower.values());
+}
+
+export function buildCurlArgs(url: string, opts: FetchOptions, timeoutMs: number, proxy = "", ua = DEFAULT_UA): string[] {
+  const merged = mergeHeaders(
+    { "user-agent": ua, "accept-language": DEFAULT_ACCEPT_LANGUAGE, accept: DEFAULT_ACCEPT },
+    opts.headers,
+  );
+  let effectiveUa = ua;
+  const extraHeaders: Array<[string, string]> = [];
+  for (const [k, v] of Object.entries(merged)) {
+    if (k.toLowerCase() === "user-agent") effectiveUa = v;
+    else extraHeaders.push([k, v]);
+  }
+  const args = [
+    "-sS",
+    "--compressed",
+    "--max-time",
+    String(Math.max(1, Math.round(timeoutMs / 1000))),
+    "-A",
+    effectiveUa,
+    "-w",
+    "\n__STATUS__%{http_code}\n__CT__%{content_type}\n__URL__%{url_effective}",
+  ];
+  if (opts.redirect !== "manual") args.push("-L", "--max-redirs", "5");
+  if (proxy) args.push("-x", proxy);
+  if ((opts.method ?? "GET") !== "GET") args.push("-X", opts.method!);
+  for (const [k, v] of extraHeaders) args.push("-H", `${k}: ${v}`);
+  if (opts.body) args.push("--data-binary", opts.body);
+  args.push(url);
+  return args;
+}
 
 function decode(bytes: Buffer, contentType: string): string {
   const charset = /charset=([\w-]+)/i.exec(contentType)?.[1]?.toLowerCase();
@@ -73,27 +113,8 @@ const CURL_OK = (() => {
   }
 })();
 
-async function viaCurl(url: string, opts: FetchOptions, timeoutMs: number, proxy = ""): Promise<HttpResponse> {
-  const args = [
-    "-sS",
-    "--compressed",
-    "--max-time",
-    String(Math.max(1, Math.round(timeoutMs / 1000))),
-    "-A",
-    DEFAULT_UA,
-    "-H",
-    "accept-language: zh-CN,zh;q=0.9,en;q=0.8",
-    "-H",
-    "accept: text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
-    "-w",
-    "\n__STATUS__%{http_code}\n__CT__%{content_type}\n__URL__%{url_effective}",
-  ];
-  if (opts.redirect !== "manual") args.push("-L", "--max-redirs", "5");
-  if (proxy) args.push("-x", proxy);
-  if ((opts.method ?? "GET") !== "GET") args.push("-X", opts.method!);
-  for (const [k, v] of Object.entries(opts.headers ?? {})) args.push("-H", `${k}: ${v}`);
-  if (opts.body) args.push("--data-binary", opts.body);
-  args.push(url);
+async function viaCurl(url: string, opts: FetchOptions, timeoutMs: number, proxy = "", ua = DEFAULT_UA): Promise<HttpResponse> {
+  const args = buildCurlArgs(url, opts, timeoutMs, proxy, ua);
 
   return new Promise<HttpResponse>((resolve, reject) => {
     const child = spawn("curl", args);
@@ -153,7 +174,7 @@ export function createHttp(options: { proxy?: string; timeoutMs?: number; gapMs?
 
     if (CURL_OK) {
       try {
-        return await viaCurl(url, opts, timeout, proxy);
+        return await viaCurl(url, opts, timeout, proxy, ua);
       } catch {
         /* curl 失败就落到 fetch */
       }
@@ -163,12 +184,14 @@ export function createHttp(options: { proxy?: string; timeoutMs?: number; gapMs?
     const timer = setTimeout(() => ac.abort(), timeout);
     const init: RequestInit & { dispatcher?: unknown } = {
       method: opts.method ?? "GET",
-      headers: {
-        "user-agent": ua,
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
-        ...opts.headers,
-      },
+      headers: mergeHeaders(
+        {
+          "user-agent": ua,
+          "accept-language": DEFAULT_ACCEPT_LANGUAGE,
+          accept: DEFAULT_ACCEPT,
+        },
+        opts.headers,
+      ),
       redirect: opts.redirect ?? "follow",
       signal: ac.signal,
       body: opts.body,
@@ -201,7 +224,10 @@ export function createHttp(options: { proxy?: string; timeoutMs?: number; gapMs?
     raw,
     text: raw,
     async json<T>(url: string, opts: FetchOptions = {}) {
-      const response = await raw(url, { ...opts, headers: { accept: "application/json", ...opts.headers } });
+      const response = await raw(url, {
+        ...opts,
+        headers: mergeHeaders({ accept: "application/json" }, opts.headers),
+      });
       let data: T;
       try {
         data = JSON.parse(response.body) as T;

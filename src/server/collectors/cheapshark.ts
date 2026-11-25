@@ -32,6 +32,8 @@ const STORE_NAME: Record<string, string> = {
   "35": "DreamGame",
 };
 
+const CHEAPSHARK_USER_AGENT = "FreebieRadar/1.0 (https://github.com/ZiChuanLan/freebie-radar)";
+
 /** CheapShark 免费与史低白菜游戏 API（免登录、JSON，覆盖 Steam/Epic/GOG/Fanatical/Humble 等）。 */
 export const cheapsharkCollector: Collector = {
   kind: "cheapshark",
@@ -43,7 +45,10 @@ export const cheapsharkCollector: Collector = {
     const url = "https://www.cheapshark.com/api/1.0/deals?upperPrice=" + upperPrice + "&pageSize=" + pageSize + "&onSale=1";
     ctx.log("GET " + url);
 
-    const res = await ctx.http.json<Deal[]>(url);
+    // 必须传非浏览器应用 UA：CheapShark 拒绝 curl 默认 UA（400），而 Cloudflare 会拦截带 Chrome UA 的非浏览器指纹（403）
+    const res = await ctx.http.json<Deal[]>(url, {
+      headers: { "user-agent": CHEAPSHARK_USER_AGENT },
+    });
     if (res.status !== 200) throw new Error("CheapShark HTTP " + res.status);
     const list = Array.isArray(res.data) ? res.data : [];
 
